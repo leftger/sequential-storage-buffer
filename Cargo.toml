@@ -1,0 +1,20 @@
+[package]
+name = "sequential-storage-buffer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A RAM-buffered queue on top of sequential-storage for NOR flash."
+keywords = ["no_std", "embedded", "flash", "storage", "queue"]
+rust-version = "1.87"
+
+[dependencies]
+sequential-storage = { path = "../sequential-storage" }
+embedded-storage-async = "0.4.1"
+
+[dev-dependencies]
+sequential-storage = { path = "../sequential-storage", features = ["_test"] }
+futures = { version = "0.3.30", features = ["executor"] }
+
+[features]
+# Re-expose sequential-storage's test mock for downstream crate testing.
+test-utils = ["sequential-storage/_test"]
