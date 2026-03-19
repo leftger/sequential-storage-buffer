@@ -1,7 +1,7 @@
 // Integration tests using sequential-storage's MockFlash.
 //
 // Run with:
-//   cargo test --features sequential-storage-buffer/test-utils
+//   cargo test --features test-utils
 
 use futures::executor::block_on;
 use sequential_storage::{
@@ -9,7 +9,7 @@ use sequential_storage::{
     mock_flash::MockFlashBase,
     queue::{QueueConfig, QueueStorage},
 };
-use sequential_storage_buffer::BufferedQueue;
+use sequential_storage_buffer::{BufferedQueue, OverflowPolicy};
 
 // 4 pages × 64 words × 4 bytes/word = 1 KiB flash
 type MockFlash = MockFlashBase<4, 4, 64>;
@@ -29,8 +29,8 @@ fn enqueue_drain_pop() {
         let mut out = [0u8; 64];
 
         // Enqueue two items into RAM — no flash I/O yet.
-        queue.enqueue(b"hello").unwrap();
-        queue.enqueue(b"world").unwrap();
+        queue.enqueue(b"hello", OverflowPolicy::Err).unwrap();
+        queue.enqueue(b"world", OverflowPolicy::Err).unwrap();
         assert_eq!(queue.ram_pending_count(), 2);
 
         // Drain RAM → flash.
@@ -61,7 +61,7 @@ fn pop_reads_flash_before_ram() {
         queue.storage().push(&aligned[..5], false).await.unwrap();
 
         // Buffer "second" in RAM only.
-        queue.enqueue(b"second").unwrap();
+        queue.enqueue(b"second", OverflowPolicy::Err).unwrap();
 
         // pop drains RAM to flash first, then pops the oldest flash item ("first").
         let data = queue.pop(&mut out, false).await.unwrap().unwrap();
@@ -76,7 +76,9 @@ fn pop_reads_flash_before_ram() {
 }
 
 #[test]
-fn enqueue_returns_err_when_ram_full() {
+fn overflow_policy_err() {
+    // 16-byte ring: each item costs 2 (prefix) + data.len() bytes.
+    // 3 items of 4 bytes = 3*6 = 18 bytes — won't all fit.
     let mut queue: BufferedQueue<MockFlash, NoCache, 16> = {
         let flash = MockFlash::new(
             sequential_storage::mock_flash::WriteCountCheck::Twice,
@@ -88,9 +90,47 @@ fn enqueue_returns_err_when_ram_full() {
         BufferedQueue::new(storage)
     };
 
-    // 16-byte ring: each item costs 2 (prefix) + data.len() bytes.
-    // 3 items of 4 bytes = 3*6 = 18 bytes — won't all fit.
-    queue.enqueue(b"aaaa").unwrap(); // 6 bytes used
-    queue.enqueue(b"bbbb").unwrap(); // 12 bytes used
-    assert!(queue.enqueue(b"cccc").is_err()); // 18 > 16: no room
+    queue.enqueue(b"aaaa", OverflowPolicy::Err).unwrap(); // 6 bytes used
+    queue.enqueue(b"bbbb", OverflowPolicy::Err).unwrap(); // 12 bytes used
+    assert!(queue.enqueue(b"cccc", OverflowPolicy::Err).is_err()); // 18 > 16
+}
+
+#[test]
+fn overflow_policy_discard_oldest() {
+    // Same tight ring as above.
+    let mut queue: BufferedQueue<MockFlash, NoCache, 16> = {
+        let flash = MockFlash::new(
+            sequential_storage::mock_flash::WriteCountCheck::Twice,
+            None,
+            true,
+        );
+        let config = QueueConfig::new(MockFlash::FULL_FLASH_RANGE);
+        let storage = QueueStorage::new(flash, config, NoCache::new());
+        BufferedQueue::new(storage)
+    };
+
+    queue.enqueue(b"aaaa", OverflowPolicy::Err).unwrap();
+    queue.enqueue(b"bbbb", OverflowPolicy::Err).unwrap();
+    // "aaaa" is evicted to make room for "cccc"
+    queue.enqueue(b"cccc", OverflowPolicy::DiscardOldest).unwrap();
+
+    assert_eq!(queue.ram_pending_count(), 2);
+    assert_eq!(queue.oldest_ram_item_len(), Some(4));
+
+    // Drain to flash and pop to verify FIFO order with "aaaa" evicted.
+    block_on(async {
+        let mut out = [0u8; 64];
+        let data = queue.pop(&mut out, false).await.unwrap().unwrap();
+        assert_eq!(data, b"bbbb");
+        let data = queue.pop(&mut out, false).await.unwrap().unwrap();
+        assert_eq!(data, b"cccc");
+    });
+}
+
+#[test]
+fn capacity_helpers() {
+    let queue = make_queue();
+    assert_eq!(BufferedQueue::<MockFlash, NoCache, 256>::ram_capacity_bytes(), 256);
+    assert_eq!(queue.ram_free_bytes(), 256);
+    assert_eq!(queue.ram_bytes_used(), 0);
 }

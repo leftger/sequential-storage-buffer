@@ -8,6 +8,11 @@
 //! asynchronously drains them to flash via [`drain_one`][BufferedQueue::drain_one] or
 //! [`drain_all`][BufferedQueue::drain_all].
 //!
+//! # Overflow policy
+//!
+//! When the RAM ring is full, [`enqueue`][BufferedQueue::enqueue] behaviour is controlled by
+//! [`OverflowPolicy`]: either return `Err(())` or silently evict the oldest buffered item.
+//!
 //! # Ordering
 //!
 //! FIFO ordering is preserved. [`pop`][BufferedQueue::pop] and [`peek`][BufferedQueue::peek]
@@ -18,9 +23,20 @@
 //! Items that are in the RAM ring and have not yet been drained to flash **will be lost** on
 //! power loss. Items that have been drained follow the power-fail safety guarantees of the
 //! underlying `sequential-storage` crate.
+//!
+//! # Embassy / ISR-safe use
+//!
+//! Enable the `embassy` feature for [`SharedRamRing`], which wraps the ring in a critical-section
+//! mutex so it can be enqueued to from an interrupt handler, and provides an Embassy
+//! [`Signal`][embassy_sync::signal::Signal] to wake a drain task the moment data arrives.
 
 mod ram_ring;
 pub use ram_ring::RamRing;
+
+#[cfg(feature = "embassy")]
+pub mod shared;
+#[cfg(feature = "embassy")]
+pub use shared::SharedRamRing;
 
 use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
 use sequential_storage::{
@@ -28,6 +44,19 @@ use sequential_storage::{
     cache::CacheImpl,
     queue::QueueStorage,
 };
+
+/// Controls what happens when [`enqueue`][BufferedQueue::enqueue] is called on a full RAM ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum OverflowPolicy {
+    /// Return `Err(())` — the caller decides whether to drop the item or drain first.
+    Err,
+    /// Silently discard the oldest buffered item(s) to make room for the new one.
+    ///
+    /// The new item is always accepted as long as it physically fits in the ring
+    /// (i.e. `data.len() + 2 <= RAM_BYTES`).
+    DiscardOldest,
+}
 
 /// A write-buffered queue that accepts items into a RAM ring and drains them to NOR flash.
 ///
@@ -40,17 +69,19 @@ use sequential_storage::{
 /// ## Usage pattern
 ///
 /// ```ignore
-/// // Fast path — called from a tight loop or interrupt handler:
-/// queue.enqueue(&sample)?;
+/// // Fast path — called from a tight loop:
+/// queue.enqueue(&sample, OverflowPolicy::Err)?;
 ///
 /// // Slow path — called from a lower-priority task or on a timer:
 /// queue.drain_all(&mut scratch, false).await?;
 ///
 /// // Read path (drains any remaining RAM items to flash first, then pops):
-/// if let Some(data) = queue.pop(&mut buf).await? {
+/// if let Some(data) = queue.pop(&mut buf, false).await? {
 ///     // process data
 /// }
 /// ```
+///
+/// For ISR-safe use, enable the `embassy` feature and use [`SharedRamRing`] instead.
 pub struct BufferedQueue<S: NorFlash, C: CacheImpl, const RAM_BYTES: usize> {
     storage: QueueStorage<S, C>,
     ram: RamRing<RAM_BYTES>,
@@ -67,14 +98,13 @@ impl<S: NorFlash, C: CacheImpl, const RAM_BYTES: usize> BufferedQueue<S, C, RAM_
 
     /// Enqueue an item into the RAM ring buffer.
     ///
-    /// This is **synchronous and never touches flash**. Returns `Err(())` if the ring is full;
-    /// the caller can call [`drain_one`][Self::drain_one] to make room and retry, or treat the
-    /// failure as a dropped sample.
-    ///
-    /// To check available space before pushing, use [`oldest_ram_item_len`][Self::oldest_ram_item_len]
-    /// or compare [`ram_bytes_used`][Self::ram_bytes_used] against `RAM_BYTES`.
-    pub fn enqueue(&mut self, data: &[u8]) -> Result<(), ()> {
-        self.ram.push(data)
+    /// This is **synchronous and never touches flash**. When the ring is full the behaviour
+    /// is determined by `policy`: return `Err(())` or evict the oldest item.
+    pub fn enqueue(&mut self, data: &[u8], policy: OverflowPolicy) -> Result<(), ()> {
+        match policy {
+            OverflowPolicy::Err => self.ram.push(data),
+            OverflowPolicy::DiscardOldest => self.ram.push_overwriting(data),
+        }
     }
 
     /// Drain one item from the RAM ring to flash.
@@ -147,6 +177,16 @@ impl<S: NorFlash, C: CacheImpl, const RAM_BYTES: usize> BufferedQueue<S, C, RAM_
             self.drain_all(data_buffer, allow_overwrite).await?;
         }
         self.storage.peek(data_buffer).await
+    }
+
+    /// Total capacity of the RAM ring in bytes (including 2-byte per-item length prefixes).
+    pub const fn ram_capacity_bytes() -> usize {
+        RAM_BYTES
+    }
+
+    /// Free bytes remaining in the RAM ring.
+    pub fn ram_free_bytes(&self) -> usize {
+        RAM_BYTES - self.ram.bytes_used()
     }
 
     /// Byte length of the oldest item in the RAM ring, or `None` if the ring is empty.

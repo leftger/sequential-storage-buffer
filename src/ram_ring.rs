@@ -58,13 +58,26 @@ impl<const N: usize> RamRing<N> {
         if self.used + total > N {
             return Err(());
         }
-        self.write_byte(len as u8);
-        self.write_byte((len >> 8) as u8);
-        for &b in data {
-            self.write_byte(b);
+        self.write_raw(data);
+        Ok(())
+    }
+
+    /// Push an item, discarding the oldest item(s) to make room if necessary.
+    ///
+    /// Returns `Err(())` only if the item is larger than the entire ring capacity.
+    pub fn push_overwriting(&mut self, data: &[u8]) -> Result<(), ()> {
+        let len = data.len();
+        if len > u16::MAX as usize {
+            return Err(());
         }
-        self.used += total;
-        self.item_count += 1;
+        let total = 2 + len;
+        if total > N {
+            return Err(());
+        }
+        while self.used + total > N {
+            self.discard_oldest();
+        }
+        self.write_raw(data);
         Ok(())
     }
 
@@ -91,6 +104,17 @@ impl<const N: usize> RamRing<N> {
             self.used -= 2 + len;
             self.item_count -= 1;
         }
+    }
+
+    fn write_raw(&mut self, data: &[u8]) {
+        let len = data.len();
+        self.write_byte(len as u8);
+        self.write_byte((len >> 8) as u8);
+        for &b in data {
+            self.write_byte(b);
+        }
+        self.used += 2 + len;
+        self.item_count += 1;
     }
 
     fn write_byte(&mut self, b: u8) {
@@ -147,5 +171,22 @@ mod tests {
         assert_eq!(ring.peek_into(&mut buf), Some(b"def".as_ref()));
         ring.discard_oldest();
         assert_eq!(ring.peek_into(&mut buf), Some(b"ghi".as_ref()));
+    }
+
+    #[test]
+    fn push_overwriting_evicts_oldest() {
+        // 10-byte ring fits exactly 2 items of 3 bytes (2*(2+3)=10)
+        let mut ring: RamRing<10> = RamRing::new();
+        ring.push(b"aaa").unwrap();
+        ring.push(b"bbb").unwrap();
+
+        // Overwriting push evicts "aaa" to make room for "ccc"
+        ring.push_overwriting(b"ccc").unwrap();
+        assert_eq!(ring.len(), 2);
+
+        let mut buf = [0u8; 8];
+        assert_eq!(ring.peek_into(&mut buf), Some(b"bbb".as_ref()));
+        ring.discard_oldest();
+        assert_eq!(ring.peek_into(&mut buf), Some(b"ccc".as_ref()));
     }
 }

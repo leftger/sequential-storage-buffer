@@ -10,11 +10,17 @@ rust-version = "1.87"
 [dependencies]
 sequential-storage = { path = "../sequential-storage" }
 embedded-storage-async = "0.4.1"
+defmt = { version = "1.0.1", optional = true }
+embassy-sync = { version = "0.6", optional = true }
 
 [dev-dependencies]
 sequential-storage = { path = "../sequential-storage", features = ["_test"] }
 futures = { version = "0.3.30", features = ["executor"] }
 
 [features]
+# Add defmt::Format to public types and forward the feature to sequential-storage.
+defmt = ["dep:defmt", "sequential-storage/defmt"]
+# ISR-safe SharedRamRing with Embassy Signal wakeup for the drain task.
+embassy = ["dep:embassy-sync"]
 # Re-expose sequential-storage's test mock for downstream crate testing.
 test-utils = ["sequential-storage/_test"]
